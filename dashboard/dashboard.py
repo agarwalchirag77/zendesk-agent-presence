@@ -202,6 +202,19 @@ def save_roster_month(month: str, records):
         cur.close()
 
 
+def _edited_to_records(month, df):
+    """Flatten the wide editor grid into per-(agent, dow) rows."""
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    recs = []
+    for _, r in df.iterrows():
+        cs = (str(r["Custom start"]).strip() or None) if pd.notna(r["Custom start"]) else None
+        ce = (str(r["Custom end"]).strip() or None) if pd.notna(r["Custom end"]) else None
+        for label, dw in DAY_COLS:
+            recs.append((month, str(r["AGENT_ID"]), r["Agent"], r["Level"], dw,
+                         r[label], cs, ce, now))
+    return recs
+
+
 def _parse_hm(s):
     try:
         h, m = str(s).strip().split(":")
@@ -471,16 +484,45 @@ with tab4:
     )
 
     if st.button("💾 Save roster", type="primary"):
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        recs = []
-        for _, r in edited.iterrows():
-            cs = (str(r["Custom start"]).strip() or None) if pd.notna(r["Custom start"]) else None
-            ce = (str(r["Custom end"]).strip() or None) if pd.notna(r["Custom end"]) else None
-            for label, dw in DAY_COLS:
-                recs.append((rmonth, str(r["AGENT_ID"]), r["Agent"], r["Level"], dw,
-                             r[label], cs, ce, now))
         try:
-            save_roster_month(rmonth, recs)
+            save_roster_month(rmonth, _edited_to_records(rmonth, edited))
             st.success(f"Saved roster for {rmonth} ({len(edited)} agents).")
         except Exception as exc:  # noqa: BLE001
             st.error(f"Save failed: {exc}")
+
+    with st.expander("➕ ➖  Add / remove agents"):
+        st.caption("Add/remove saves the current grid immediately (including any edits above).")
+        existing_ids = set(edited["AGENT_ID"].astype(str))
+        try:
+            dirdf = run_df("SELECT AGENT_ID, COALESCE(NAME, AGENT_ID) AS NAME FROM AGENTS ORDER BY NAME")
+        except Exception:
+            dirdf = pd.DataFrame(columns=["AGENT_ID", "NAME"])
+        addable = [(str(t.AGENT_ID), str(t.NAME)) for t in dirdf.itertuples()
+                   if str(t.AGENT_ID) not in existing_ids]
+
+        ac = st.columns([4, 1])
+        if addable:
+            pick = ac[0].selectbox("Add agent from directory", addable,
+                                   format_func=lambda t: f"{t[1]} ({t[0]})", key=f"add_{rmonth}")
+            if ac[1].button("Add", key=f"addbtn_{rmonth}"):
+                new_row = {"AGENT_ID": pick[0], "Agent": pick[1], "Level": "L1",
+                           "Custom start": "", "Custom end": "",
+                           **{label: "off" for label, _ in DAY_COLS}}
+                merged = pd.concat([edited, pd.DataFrame([new_row])], ignore_index=True)
+                save_roster_month(rmonth, _edited_to_records(rmonth, merged))
+                st.session_state.pop(f"roster_ed_{rmonth}", None)
+                st.rerun()
+        else:
+            ac[0].caption("Nobody left to add — all directory agents are on the roster, or the "
+                          "AGENTS directory is empty (run scripts/sync_agents.py to populate it).")
+
+        rc = st.columns([4, 1])
+        cur_agents = [(str(r["AGENT_ID"]), str(r["Agent"])) for _, r in edited.iterrows()]
+        if cur_agents:
+            rpick = rc[0].selectbox("Remove agent from this month", cur_agents,
+                                    format_func=lambda t: f"{t[1]} ({t[0]})", key=f"rm_{rmonth}")
+            if rc[1].button("Remove", key=f"rmbtn_{rmonth}"):
+                kept = edited[edited["AGENT_ID"].astype(str) != rpick[0]]
+                save_roster_month(rmonth, _edited_to_records(rmonth, kept))
+                st.session_state.pop(f"roster_ed_{rmonth}", None)
+                st.rerun()
