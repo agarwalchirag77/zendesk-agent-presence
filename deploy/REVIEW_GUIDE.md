@@ -117,7 +117,6 @@ dashboards are being retired; Streamlit is the replacement.)
 so Zendesk is posting to a dead URL. Fix = re-fetch the URL (section 1) and update
 the Zendesk webhook. No Snowflake data is lost during an outage — SQLite buffers
 and flushes on recovery.
-```
 
 ## Maintaining the shift roster
 Shifts rotate monthly and are edited **in the dashboard → Roster tab** (stored in
