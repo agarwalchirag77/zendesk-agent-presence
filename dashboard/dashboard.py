@@ -157,10 +157,23 @@ tab1, tab2, tab3 = st.tabs(["Shift compliance", "Presence", "Workload"])
 # --- Shift compliance (computed in Python from V_SESSIONS) ----------------
 with tab1:
     st.subheader(f"Shift compliance — {day}")
+    SHIFT_LABELS = {"M": "Morning 05–14", "A": "Afternoon 14–23",
+                    "N": "Night 23–05 (+1d)", "D": "Day 08–17", "E": "11–20"}
+    ctl = st.columns([3, 3, 2])
+    sel_shifts = ctl[0].multiselect(
+        "Shifts to include", list(SHIFT_LABELS), default=list(SHIFT_LABELS),
+        format_func=lambda s: SHIFT_LABELS[s])
+    override = ctl[1].selectbox(
+        "Evaluate late/early against", ["Roster (each agent's own shift)"] + list(SHIFT_LABELS),
+        format_func=lambda s: s if s.startswith("Roster") else SHIFT_LABELS[s])
+    break_min = ctl[2].number_input("Flag mid-shift offline over (min)", min_value=0, value=5, step=1)
+    override_code = None if override.startswith("Roster") else override
+
     dow = int(day.strftime("%w"))
-    scheduled = [(aid, info) for aid, info in ROSTER.items() if dow in info[2]]
+    scheduled = [(aid, info) for aid, info in ROSTER.items()
+                 if dow in info[2] and info[2][dow] in sel_shifts]
     if not scheduled:
-        st.info("Nobody rostered on this day.")
+        st.info("Nobody rostered for the selected shifts on this day.")
     else:
         lo = (day - timedelta(days=1)).isoformat()
         hi = (day + timedelta(days=1)).isoformat()
@@ -175,47 +188,68 @@ with tab1:
 
         out = []
         for aid, (name, level, week) in scheduled:
-            sh, sm, eh, em, eoff = SHIFTS[week[dow]]
+            eff = override_code or week[dow]          # selected shift wins over roster
+            sh, sm, eh, em, eoff = SHIFTS[eff]
             start = (datetime(day.year, day.month, day.day, sh, sm, tzinfo=IST)
                      .astimezone(UTC).replace(tzinfo=None))
             end = ((datetime(day.year, day.month, day.day, eh, em, tzinfo=IST)
                     + timedelta(days=eoff)).astimezone(UTC).replace(tzinfo=None))
             win = (end - start).total_seconds()
-            online = 0.0
-            first_login = last_online = last_logout = None
+
+            # Clamp each overlapping session to the shift window -> online periods.
+            periods = []
             has_open = False
+            last_logout = None
             for lin, lout in by_agent.get(aid, []):
                 lout_eff = lout if lout is not None else now_utc
-                ov = min(lout_eff, end) - max(lin, start)
-                if ov.total_seconds() > 0:
-                    online += ov.total_seconds()
-                    if first_login is None or lin < first_login:
-                        first_login = lin
-                    oe = min(lout_eff, end)
-                    if last_online is None or oe > last_online:
-                        last_online = oe
+                a, b = max(lin, start), min(lout_eff, end)
+                if b > a:
+                    periods.append((a, b))
                     if lout is None:
                         has_open = True
                     elif last_logout is None or lout > last_logout:
                         last_logout = lout
+            periods.sort()
+
+            online = sum((b - a).total_seconds() for a, b in periods)
+            first_login = periods[0][0] if periods else None
+            last_online = periods[-1][1] if periods else None
+            # Intermediary offline = gaps BETWEEN online periods within the shift.
+            breaks, break_secs = 0, 0.0
+            for i in range(1, len(periods)):
+                gap = (periods[i][0] - periods[i - 1][1]).total_seconds()
+                if gap > 0:
+                    breaks += 1
+                    break_secs += gap
+
             grace = 30 * 60 if level == "L2" else 0
-            login_delay = first_login is None or first_login > start + timedelta(minutes=15)
-            early_logout = last_online is None or last_online < end - timedelta(seconds=grace)
+            login_delay = (first_login is None) or (first_login > start + timedelta(minutes=15))
+            early_logout = (last_online is None) or (last_online < end - timedelta(seconds=grace))
+            broke = break_secs > break_min * 60
+
             out.append({
-                "Agent": name, "Lvl": level, "Shift": week[dow],
+                "Agent": name, "Lvl": level, "Shift": eff,
                 "Window (IST)": f"{_ist(start)[-8:]}–{_ist(end)[-8:]}",
-                "First login": _ist(first_login),
-                "Last logout": "still online" if has_open else _ist(last_logout),
+                "First login": "" if first_login is None else _ist(first_login)[-8:],
+                "Last logout": "still online" if has_open
+                               else (_ist(last_logout)[-8:] if last_logout else ""),
                 "Not online": _hms(max(0, win - online)),
+                "Breaks": breaks,
+                "Break time": _hms(break_secs),
                 "Late login": "⚠️" if login_delay else "",
                 "Early logout": "⚠️" if early_logout else "",
+                "Mid-shift offline": "⚠️" if broke else "",
             })
         df = pd.DataFrame(out).sort_values(["Lvl", "Agent"])
-        c = st.columns(3)
-        c[0].metric("Late logins", int((df["Late login"] == "⚠️").sum()))
-        c[1].metric("Early logouts", int((df["Early logout"] == "⚠️").sum()))
-        c[2].metric("Absent", int((df["First login"] == "").sum()))
+        m = st.columns(4)
+        m[0].metric("Late logins", int((df["Late login"] == "⚠️").sum()))
+        m[1].metric("Early logouts", int((df["Early logout"] == "⚠️").sum()))
+        m[2].metric("Mid-shift offline", int((df["Mid-shift offline"] == "⚠️").sum()))
+        m[3].metric("Absent", int((df["First login"] == "").sum()))
         st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption("Times IST. 'Breaks' = times the agent went offline mid-shift; "
+                   "'Break time' = total offline between first login and last activity "
+                   "within the shift window. Use 'Evaluate against' to override the roster shift.")
 
 # --- Presence -------------------------------------------------------------
 with tab2:
