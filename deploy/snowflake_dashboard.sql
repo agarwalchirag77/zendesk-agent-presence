@@ -153,3 +153,20 @@ SELECT TO_DATE(CONVERT_TIMEZONE('UTC','Asia/Kolkata', TS_UTC))    AS IST_DAY,
 FROM V_STATE_EVENTS
 WHERE TS_UTC IS NOT NULL
 GROUP BY 1 ORDER BY 1;
+
+
+-- ############################  ROSTER TABLE  ################################
+-- Maintained via the dashboard's "Roster" tab (the app auto-creates it). Shown
+-- here for reference / to grant write access if the dashboard uses a read-only
+-- role: the dashboard role needs INSERT/UPDATE/DELETE on this table.
+CREATE TABLE IF NOT EXISTS AGENT_ROSTER (
+  MONTH        VARCHAR,   -- 'YYYY-MM'
+  AGENT_ID     VARCHAR,
+  AGENT_NAME   VARCHAR,
+  LEVEL        VARCHAR,   -- L1 / L2
+  DOW          NUMBER,    -- 0=Sun .. 6=Sat
+  SHIFT_CODE   VARCHAR,   -- off / M / A / N / D / E / CUSTOM
+  CUSTOM_START VARCHAR,   -- 'HH:MM' when SHIFT_CODE = CUSTOM
+  CUSTOM_END   VARCHAR,
+  UPDATED_AT   VARCHAR
+);

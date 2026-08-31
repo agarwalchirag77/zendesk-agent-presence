@@ -118,3 +118,10 @@ so Zendesk is posting to a dead URL. Fix = re-fetch the URL (section 1) and upda
 the Zendesk webhook. No Snowflake data is lost during an outage — SQLite buffers
 and flushes on recovery.
 ```
+
+## Maintaining the shift roster
+Shifts rotate monthly and are edited **in the dashboard → Roster tab** (stored in
+Snowflake `AGENT_ROSTER`). Each month: open Roster, pick the month, "Copy previous
+month" (or "Load built-in template"), adjust the rotations, **Save**. The
+Shift-compliance tab reads this per selected date, so late-login / early-logout /
+mid-shift-offline are evaluated against the correct current shift.

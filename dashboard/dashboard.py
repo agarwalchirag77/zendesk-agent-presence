@@ -40,7 +40,7 @@ SHIFTS = {
 def _wk(shift, days):
     return {d: shift for d in days}
 
-ROSTER = {
+DEFAULT_ROSTER = {
     # ---- L1 ----
     "53822311261721": ("Sasidharan M", "L1", _wk("N", [1, 2, 3, 4, 5, 6])),
     "56297164605209": ("Tanisha Nigam", "L1", {**_wk("A", [1, 2, 3, 4, 5]), 0: "M"}),
@@ -92,6 +92,7 @@ if not _gate():
 @st.cache_resource
 def get_conn():
     import snowflake.connector
+    snowflake.connector.paramstyle = "qmark"   # so ? binds work for roster writes
     kwargs = dict(
         account=os.environ["SNOWFLAKE_ACCOUNT"], user=os.environ["SNOWFLAKE_USER"],
         password=os.environ["SNOWFLAKE_PASSWORD"], warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
@@ -127,10 +128,112 @@ def _ist(dt) -> str:
     return dt.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
 
 
+# --- Roster storage (Snowflake AGENT_ROSTER) ------------------------------
+DAY_COLS = [("Mon", 1), ("Tue", 2), ("Wed", 3), ("Thu", 4), ("Fri", 5), ("Sat", 6), ("Sun", 0)]
+SHIFT_CHOICES = ["off", "M", "A", "N", "D", "E", "CUSTOM"]
+SHIFT_LABELS = {"M": "Morning 05–14", "A": "Afternoon 14–23", "N": "Night 23–05 (+1d)",
+                "D": "Day 08–17", "E": "11–20", "CUSTOM": "Custom window"}
+
+
+def query(sql: str) -> pd.DataFrame:
+    """Uncached query (used for the roster, so edits reflect immediately)."""
+    cur = get_conn().cursor()
+    try:
+        cur.execute(sql)
+        cols = [c[0] for c in cur.description]
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+    return pd.DataFrame(rows, columns=cols)
+
+
+def ensure_roster_table():
+    get_conn().cursor().execute(
+        "CREATE TABLE IF NOT EXISTS AGENT_ROSTER ("
+        "MONTH VARCHAR, AGENT_ID VARCHAR, AGENT_NAME VARCHAR, LEVEL VARCHAR, "
+        "DOW NUMBER, SHIFT_CODE VARCHAR, CUSTOM_START VARCHAR, CUSTOM_END VARCHAR, "
+        "UPDATED_AT VARCHAR)")
+
+
+def default_roster_dict():
+    return {aid: {"name": n, "level": lv, "week": dict(wk), "cstart": "", "cend": ""}
+            for aid, (n, lv, wk) in DEFAULT_ROSTER.items()}
+
+
+def load_roster_month(month: str):
+    df = query(
+        "SELECT AGENT_ID, AGENT_NAME, LEVEL, DOW, SHIFT_CODE, CUSTOM_START, CUSTOM_END "
+        f"FROM AGENT_ROSTER WHERE MONTH = '{month}'")
+    roster = {}
+    for _, r in df.iterrows():
+        aid = str(r["AGENT_ID"])
+        a = roster.setdefault(aid, {"name": r["AGENT_NAME"], "level": r["LEVEL"], "week": {},
+                                    "cstart": r["CUSTOM_START"] or "", "cend": r["CUSTOM_END"] or ""})
+        code = r["SHIFT_CODE"]
+        if code and code != "off":
+            a["week"][int(r["DOW"])] = code
+    return roster
+
+
+def _roster_records(month, rd):
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    recs = []
+    for aid, a in rd.items():
+        cs = (a.get("cstart") or "").strip() or None
+        ce = (a.get("cend") or "").strip() or None
+        for _, dw in DAY_COLS:
+            recs.append((month, aid, a["name"], a["level"], dw,
+                         a["week"].get(dw, "off"), cs, ce, now))
+    return recs
+
+
+def save_roster_month(month: str, records):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM AGENT_ROSTER WHERE MONTH = ?", (month,))
+        if records:
+            cur.executemany(
+                "INSERT INTO AGENT_ROSTER (MONTH, AGENT_ID, AGENT_NAME, LEVEL, DOW, "
+                "SHIFT_CODE, CUSTOM_START, CUSTOM_END, UPDATED_AT) VALUES (?,?,?,?,?,?,?,?,?)",
+                records)
+        conn.commit()
+    finally:
+        cur.close()
+
+
+def _parse_hm(s):
+    try:
+        h, m = str(s).strip().split(":")
+        return int(h), int(m)
+    except Exception:
+        return None
+
+
+def shift_window(d, code, cstart, cend):
+    """(start_utc_naive, end_utc_naive) for shift `code` on IST date d, or None."""
+    if code == "CUSTOM":
+        a, b = _parse_hm(cstart), _parse_hm(cend)
+        if not a or not b:
+            return None
+        sh, sm = a
+        eh, em = b
+        eoff = 1 if (eh * 60 + em) <= (sh * 60 + sm) else 0
+    elif code in SHIFTS:
+        sh, sm, eh, em, eoff = SHIFTS[code]
+    else:
+        return None
+    start = datetime(d.year, d.month, d.day, sh, sm, tzinfo=IST).astimezone(UTC).replace(tzinfo=None)
+    end = (datetime(d.year, d.month, d.day, eh, em, tzinfo=IST) + timedelta(days=eoff)) \
+        .astimezone(UTC).replace(tzinfo=None)
+    return start, end
+
+
 # --- header / controls ----------------------------------------------------
 st.title("Support Agent Presence & Workload")
 try:
     get_conn()
+    ensure_roster_table()
 except Exception as exc:  # noqa: BLE001
     st.error(f"Snowflake connection failed: {exc}")
     st.stop()
@@ -152,27 +255,32 @@ k2.metric("Team online hrs (7d)", float(run_df(
 k3.metric("Items handled (7d)", int(run_df(
     "SELECT COUNT(*) N FROM V_WORK_ITEMS WHERE ADDED_UTC >= DATEADD('day',-7,SYSDATE())")["N"][0]))
 
-tab1, tab2, tab3 = st.tabs(["Shift compliance", "Presence", "Workload"])
+tab1, tab2, tab3, tab4 = st.tabs(["Shift compliance", "Presence", "Workload", "Roster"])
 
 # --- Shift compliance (computed in Python from V_SESSIONS) ----------------
 with tab1:
     st.subheader(f"Shift compliance — {day}")
-    SHIFT_LABELS = {"M": "Morning 05–14", "A": "Afternoon 14–23",
-                    "N": "Night 23–05 (+1d)", "D": "Day 08–17", "E": "11–20"}
+    month = day.strftime("%Y-%m")
+    roster = load_roster_month(month)
+
+    filt = [c for c in SHIFT_CHOICES if c != "off"]
     ctl = st.columns([3, 3, 2])
     sel_shifts = ctl[0].multiselect(
-        "Shifts to include", list(SHIFT_LABELS), default=list(SHIFT_LABELS),
-        format_func=lambda s: SHIFT_LABELS[s])
+        "Shifts to include", filt, default=filt,
+        format_func=lambda s: SHIFT_LABELS.get(s, s))
     override = ctl[1].selectbox(
-        "Evaluate late/early against", ["Roster (each agent's own shift)"] + list(SHIFT_LABELS),
+        "Evaluate late/early against",
+        ["Roster (each agent's own shift)", "M", "A", "N", "D", "E"],
         format_func=lambda s: s if s.startswith("Roster") else SHIFT_LABELS[s])
     break_min = ctl[2].number_input("Flag mid-shift offline over (min)", min_value=0, value=5, step=1)
     override_code = None if override.startswith("Roster") else override
 
     dow = int(day.strftime("%w"))
-    scheduled = [(aid, info) for aid, info in ROSTER.items()
-                 if dow in info[2] and info[2][dow] in sel_shifts]
-    if not scheduled:
+    scheduled = [(aid, d, d["week"][dow]) for aid, d in roster.items()
+                 if d["week"].get(dow, "off") != "off" and d["week"][dow] in sel_shifts]
+    if not roster:
+        st.info(f"No roster set for **{month}**. Add it in the **Roster** tab.")
+    elif not scheduled:
         st.info("Nobody rostered for the selected shifts on this day.")
     else:
         lo = (day - timedelta(days=1)).isoformat()
@@ -187,13 +295,12 @@ with tab1:
         now_utc = datetime.now(UTC).replace(tzinfo=None)
 
         out = []
-        for aid, (name, level, week) in scheduled:
-            eff = override_code or week[dow]          # selected shift wins over roster
-            sh, sm, eh, em, eoff = SHIFTS[eff]
-            start = (datetime(day.year, day.month, day.day, sh, sm, tzinfo=IST)
-                     .astimezone(UTC).replace(tzinfo=None))
-            end = ((datetime(day.year, day.month, day.day, eh, em, tzinfo=IST)
-                    + timedelta(days=eoff)).astimezone(UTC).replace(tzinfo=None))
+        for aid, d, code in scheduled:
+            eff = override_code or code                # selected shift wins over roster
+            win_res = shift_window(day, eff, d["cstart"], d["cend"])
+            if win_res is None:                        # e.g. CUSTOM with bad times
+                continue
+            start, end = win_res
             win = (end - start).total_seconds()
 
             # Clamp each overlapping session to the shift window -> online periods.
@@ -222,13 +329,13 @@ with tab1:
                     breaks += 1
                     break_secs += gap
 
-            grace = 30 * 60 if level == "L2" else 0
+            grace = 30 * 60 if d["level"] == "L2" else 0
             login_delay = (first_login is None) or (first_login > start + timedelta(minutes=15))
             early_logout = (last_online is None) or (last_online < end - timedelta(seconds=grace))
             broke = break_secs > break_min * 60
 
             out.append({
-                "Agent": name, "Lvl": level, "Shift": eff,
+                "Agent": d["name"], "Lvl": d["level"], "Shift": eff,
                 "Window (IST)": f"{_ist(start)[-8:]}–{_ist(end)[-8:]}",
                 "First login": "" if first_login is None else _ist(first_login)[-8:],
                 "Last logout": "still online" if has_open
@@ -247,9 +354,8 @@ with tab1:
         m[2].metric("Mid-shift offline", int((df["Mid-shift offline"] == "⚠️").sum()))
         m[3].metric("Absent", int((df["First login"] == "").sum()))
         st.dataframe(df, use_container_width=True, hide_index=True)
-        st.caption("Times IST. 'Breaks' = times the agent went offline mid-shift; "
-                   "'Break time' = total offline between first login and last activity "
-                   "within the shift window. Use 'Evaluate against' to override the roster shift.")
+        st.caption(f"Times IST. Shifts from the Roster tab for {month}. 'Breaks'/'Break time' "
+                   "= mid-shift offline. 'Evaluate against' overrides the shift window for all shown.")
 
 # --- Presence -------------------------------------------------------------
 with tab2:
@@ -308,3 +414,73 @@ with tab3:
             "WHERE ADDED_UTC >= DATEADD('day',-7,SYSDATE()) GROUP BY 1 ORDER BY ITEMS DESC")
         if not d.empty:
             st.bar_chart(d.set_index("CHANNEL"))
+
+# --- Roster editor --------------------------------------------------------
+with tab4:
+    st.subheader("Roster — monthly shifts")
+    st.caption("Per agent, set the shift for each weekday: off / M / A / N / D / E / CUSTOM. "
+               "For CUSTOM, fill Custom start/end (HH:MM, 24h IST). Save writes to Snowflake; "
+               "the Shift-compliance tab reads it for the matching month.")
+
+    base = datetime.now(IST).date().replace(day=1)
+    month_opts = []
+    for k in range(-3, 2):
+        yy = base.year + (base.month - 1 + k) // 12
+        mm = (base.month - 1 + k) % 12 + 1
+        month_opts.append(f"{yy:04d}-{mm:02d}")
+    rmonth = st.selectbox("Month", month_opts, index=month_opts.index(base.strftime("%Y-%m")))
+
+    existing = load_roster_month(rmonth)
+    idx = month_opts.index(rmonth)
+    prev = month_opts[idx - 1] if idx > 0 else None
+
+    bcol = st.columns([2, 2, 4])
+    if prev and bcol[0].button(f"Copy {prev} → {rmonth}"):
+        save_roster_month(rmonth, _roster_records(rmonth, load_roster_month(prev)))
+        st.session_state.pop(f"roster_ed_{rmonth}", None)
+        st.rerun()
+    if bcol[1].button("Load built-in template"):
+        save_roster_month(rmonth, _roster_records(rmonth, default_roster_dict()))
+        st.session_state.pop(f"roster_ed_{rmonth}", None)
+        st.rerun()
+
+    src = existing if existing else default_roster_dict()
+    if not existing:
+        st.warning(f"{rmonth} has no saved roster yet — showing the built-in template. "
+                   "Edit and Save, or use a button above.")
+
+    wide = pd.DataFrame([
+        {"AGENT_ID": aid, "Agent": a["name"], "Level": a["level"],
+         "Custom start": a.get("cstart", ""), "Custom end": a.get("cend", ""),
+         **{label: a["week"].get(dw, "off") for label, dw in DAY_COLS}}
+        for aid, a in src.items()
+    ])
+
+    edited = st.data_editor(
+        wide, use_container_width=True, hide_index=True, num_rows="fixed",
+        key=f"roster_ed_{rmonth}",
+        column_config={
+            "AGENT_ID": None,
+            "Agent": st.column_config.TextColumn("Agent", disabled=True),
+            "Level": st.column_config.SelectboxColumn("Level", options=["L1", "L2"], width="small"),
+            "Custom start": st.column_config.TextColumn("Custom start", width="small"),
+            "Custom end": st.column_config.TextColumn("Custom end", width="small"),
+            **{label: st.column_config.SelectboxColumn(label, options=SHIFT_CHOICES, width="small")
+               for label, _ in DAY_COLS},
+        },
+    )
+
+    if st.button("💾 Save roster", type="primary"):
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        recs = []
+        for _, r in edited.iterrows():
+            cs = (str(r["Custom start"]).strip() or None) if pd.notna(r["Custom start"]) else None
+            ce = (str(r["Custom end"]).strip() or None) if pd.notna(r["Custom end"]) else None
+            for label, dw in DAY_COLS:
+                recs.append((rmonth, str(r["AGENT_ID"]), r["Agent"], r["Level"], dw,
+                             r[label], cs, ce, now))
+        try:
+            save_roster_month(rmonth, recs)
+            st.success(f"Saved roster for {rmonth} ({len(edited)} agents).")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Save failed: {exc}")
