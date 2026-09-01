@@ -39,7 +39,7 @@ SHIFTS = {
 # dow: 0=Sun 1=Mon .. 6=Sat  (matches strftime('%w'))
 DAY_COLS = [("Mon", 1), ("Tue", 2), ("Wed", 3), ("Thu", 4), ("Fri", 5), ("Sat", 6), ("Sun", 0)]
 DAY_CSV = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
-CSV_COLS = ["AGENT_ID", "AGENT_NAME", "LEVEL"] + DAY_CSV + ["CUSTOM_START", "CUSTOM_END"]
+CSV_COLS = ["AGENT_ID", "AGENT_NAME"] + DAY_CSV + ["CUSTOM_START", "CUSTOM_END"]
 SHIFT_CHOICES = ["off", "M", "A", "N", "D", "E", "CUSTOM"]
 SHIFT_LABELS = {"M": "Morning 05–14", "A": "Afternoon 14–23", "N": "Night 23–05 (+1d)",
                 "D": "Day 08–17", "E": "11–20", "CUSTOM": "Custom window"}
@@ -154,12 +154,12 @@ def active_period_for(d):
 
 def load_roster_period(period: str):
     df = query(
-        "SELECT AGENT_ID, AGENT_NAME, LEVEL, DOW, SHIFT_CODE, CUSTOM_START, CUSTOM_END "
+        "SELECT AGENT_ID, AGENT_NAME, DOW, SHIFT_CODE, CUSTOM_START, CUSTOM_END "
         f"FROM AGENT_ROSTER WHERE PERIOD_START = '{period}'")
     roster = {}
     for _, r in df.iterrows():
         aid = str(r["AGENT_ID"])
-        a = roster.setdefault(aid, {"name": r["AGENT_NAME"], "level": r["LEVEL"], "week": {},
+        a = roster.setdefault(aid, {"name": r["AGENT_NAME"], "week": {},
                                     "cstart": _cell(r["CUSTOM_START"]), "cend": _cell(r["CUSTOM_END"])})
         code = r["SHIFT_CODE"]
         if code and code != "off":
@@ -190,7 +190,7 @@ def _roster_records(period, rd):
         cs = _cell(a.get("cstart")) or None
         ce = _cell(a.get("cend")) or None
         for _, dw in DAY_COLS:
-            recs.append((period, aid, a["name"], a["level"], dw,
+            recs.append((period, aid, a["name"], "", dw,
                          a["week"].get(dw, "off"), cs, ce, now))
     return recs
 
@@ -203,14 +203,14 @@ def _edited_to_records(period, df):
         cs = _cell(r["Custom start"]) or None
         ce = _cell(r["Custom end"]) or None
         for label, dw in DAY_COLS:
-            recs.append((period, str(r["AGENT_ID"]), r["Agent"], r["Level"], dw,
+            recs.append((period, str(r["AGENT_ID"]), r["Agent"], "", dw,
                          r[label], cs, ce, now))
     return recs
 
 
 def roster_to_wide(rd):
-    cols = ["AGENT_ID", "Agent", "Level", "Custom start", "Custom end"] + [l for l, _ in DAY_COLS]
-    rows = [{"AGENT_ID": aid, "Agent": a["name"], "Level": a["level"],
+    cols = ["AGENT_ID", "Agent", "Custom start", "Custom end"] + [l for l, _ in DAY_COLS]
+    rows = [{"AGENT_ID": aid, "Agent": a["name"],
              "Custom start": a.get("cstart", ""), "Custom end": a.get("cend", ""),
              **{label: a["week"].get(dw, "off") for label, dw in DAY_COLS}}
             for aid, a in rd.items()]
@@ -220,7 +220,7 @@ def roster_to_wide(rd):
 def roster_to_csv_df(rd):
     rows = []
     for aid, a in rd.items():
-        row = {"AGENT_ID": aid, "AGENT_NAME": a["name"], "LEVEL": a["level"],
+        row = {"AGENT_ID": aid, "AGENT_NAME": a["name"],
                "CUSTOM_START": a.get("cstart", ""), "CUSTOM_END": a.get("cend", "")}
         for (label, dw), csvh in zip(DAY_COLS, DAY_CSV):
             row[csvh] = a["week"].get(dw, "off")
@@ -239,14 +239,13 @@ def csv_to_records(period, df):
             skipped += 1
             continue
         name = _cell(r[cols["AGENT_NAME"]]) if "AGENT_NAME" in cols else aid
-        level = (_cell(r[cols["LEVEL"]]).upper() if "LEVEL" in cols else "L1") or "L1"
         cs = (_cell(r[cols["CUSTOM_START"]]) if "CUSTOM_START" in cols else "") or None
         ce = (_cell(r[cols["CUSTOM_END"]]) if "CUSTOM_END" in cols else "") or None
         for (label, dw), csvh in zip(DAY_COLS, DAY_CSV):
             code = (_cell(r[cols[csvh]]) if csvh in cols else "off") or "off"
             if code not in SHIFT_CHOICES:
                 code = "off"
-            recs.append((period, aid, name, level, dw, code, cs, ce, now))
+            recs.append((period, aid, name, "", dw, code, cs, ce, now))
     return recs, skipped
 
 
@@ -325,15 +324,14 @@ with tab_comp:
     roster = load_roster_period(period) if period else {}
 
     filt = [c for c in SHIFT_CHOICES if c != "off"]
-    ctl = st.columns([3, 2, 2, 2, 2])
+    ctl = st.columns([3, 2, 2, 3])
     sel_shifts = ctl[0].multiselect(
         "Shifts to include", filt, default=filt, format_func=lambda s: SHIFT_LABELS.get(s, s))
     override = ctl[1].selectbox(
         "Evaluate against", ["Roster shift", "M", "A", "N", "D", "E"],
         format_func=lambda s: s if s == "Roster shift" else SHIFT_LABELS[s])
     late_buf = ctl[2].number_input("Late-login buffer (min)", min_value=0, value=15, step=1)
-    l2_buf = ctl[3].number_input("Early-logout buffer L2 (min)", min_value=0, value=30, step=1)
-    l1_buf = ctl[4].number_input("Early-logout buffer L1 (min)", min_value=0, value=0, step=1)
+    early_buf = ctl[3].number_input("Early-logout buffer (min)", min_value=0, value=30, step=1)
     break_min = st.number_input("Flag mid-shift offline over (min)", min_value=0, value=5, step=1)
     override_code = None if override == "Roster shift" else override
 
@@ -386,12 +384,12 @@ with tab_comp:
                     breaks += 1
                     break_secs += gap
 
-            grace = (l2_buf if d["level"] == "L2" else l1_buf) * 60
+            grace = early_buf * 60
             login_delay = (first_login is None) or (first_login > start + timedelta(minutes=late_buf))
             early_logout = (last_online is None) or (last_online < end - timedelta(seconds=grace))
 
             out.append({
-                "Agent": d["name"], "Lvl": d["level"], "Shift": eff,
+                "Agent": d["name"], "Shift": eff,
                 "Window (IST)": f"{_ist(start)[-8:]}–{_ist(end)[-8:]}",
                 "First login": "" if first_login is None else _ist(first_login)[-8:],
                 "Last logout": "still online" if has_open
@@ -403,7 +401,7 @@ with tab_comp:
                 "Early logout": "⚠️" if early_logout else "",
                 "Mid-shift offline": "⚠️" if break_secs > break_min * 60 else "",
             })
-        df = pd.DataFrame(out).sort_values(["Lvl", "Agent"])
+        df = pd.DataFrame(out).sort_values("Agent")
         m = st.columns(4)
         m[0].metric("Late logins", int((df["Late login"] == "⚠️").sum()))
         m[1].metric("Early logouts", int((df["Early logout"] == "⚠️").sum()))
@@ -411,7 +409,7 @@ with tab_comp:
         m[3].metric("Absent", int((df["First login"] == "").sum()))
         st.dataframe(df, use_container_width=True, hide_index=True)
         st.caption(f"Times IST. Roster period **{period}**. Buffers: late {late_buf}m, "
-                   f"early L2 {l2_buf}m / L1 {l1_buf}m. 'Evaluate against' overrides the shift window.")
+                   f"early {early_buf}m. 'Evaluate against' overrides the shift window.")
 
 # =====================  Presence  =========================================
 with tab_pres:
@@ -496,7 +494,6 @@ with tab_roster:
         column_config={
             "AGENT_ID": None,
             "Agent": st.column_config.TextColumn("Agent", disabled=True),
-            "Level": st.column_config.SelectboxColumn("Level", options=["L1", "L2"], width="small"),
             "Custom start": st.column_config.TextColumn("Custom start", width="small"),
             "Custom end": st.column_config.TextColumn("Custom end", width="small"),
             **{label: st.column_config.SelectboxColumn(label, options=SHIFT_CHOICES, width="small")
@@ -526,7 +523,7 @@ with tab_roster:
             pick = ac[0].selectbox("Add agent from directory", addable,
                                    format_func=lambda t: f"{t[1]} ({t[0]})", key=f"add_{rperiod}")
             if ac[1].button("Add", key=f"addbtn_{rperiod}"):
-                new_row = {"AGENT_ID": pick[0], "Agent": pick[1], "Level": "L1",
+                new_row = {"AGENT_ID": pick[0], "Agent": pick[1],
                            "Custom start": "", "Custom end": "",
                            **{label: "off" for label, _ in DAY_COLS}}
                 merged = pd.concat([edited, pd.DataFrame([new_row])], ignore_index=True)
