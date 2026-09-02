@@ -66,18 +66,44 @@ if not _gate():
 
 
 # --- Snowflake ------------------------------------------------------------
-@st.cache_resource
-def get_conn():
+def _connect():
     import snowflake.connector
     snowflake.connector.paramstyle = "qmark"   # so ? binds work for roster writes
     kwargs = dict(
         account=os.environ["SNOWFLAKE_ACCOUNT"], user=os.environ["SNOWFLAKE_USER"],
         password=os.environ["SNOWFLAKE_PASSWORD"], warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
         database=os.environ["SNOWFLAKE_DATABASE"], schema=os.environ["SNOWFLAKE_SCHEMA"],
+        client_session_keep_alive=True,   # heartbeat so the token doesn't idle-expire
     )
     if os.environ.get("SNOWFLAKE_ROLE"):
         kwargs["role"] = os.environ["SNOWFLAKE_ROLE"]
     return snowflake.connector.connect(**kwargs)
+
+
+@st.cache_resource
+def get_conn():
+    return _connect()
+
+
+def _is_conn_error(exc) -> bool:
+    m = str(exc).lower()
+    return any(s in m for s in (
+        "390114", "390111", "250002", "expired", "authenticat",
+        "connection is closed", "session token", "session no longer exists"))
+
+
+def _with_conn(fn, _retry=True):
+    """Run fn(conn); on an expired/closed session, drop the cached conn, reconnect, retry once."""
+    try:
+        return fn(get_conn())
+    except Exception as exc:  # noqa: BLE001
+        if _retry and _is_conn_error(exc):
+            try:
+                get_conn.clear()
+            except Exception:
+                pass
+            return _with_conn(fn, _retry=False)
+        raise
 
 
 @st.cache_data(ttl=60)
@@ -86,15 +112,30 @@ def run_df(sql: str) -> pd.DataFrame:
 
 
 def query(sql: str) -> pd.DataFrame:
-    """Uncached query (used for the roster, so edits reflect immediately)."""
-    cur = get_conn().cursor()
-    try:
-        cur.execute(sql)
-        cols = [c[0] for c in cur.description] if cur.description else []
-        rows = cur.fetchall()
-    finally:
-        cur.close()
-    return pd.DataFrame(rows, columns=cols)
+    """Uncached query with auto-reconnect on token expiry."""
+    def _q(conn):
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            cols = [c[0] for c in cur.description] if cur.description else []
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+        return pd.DataFrame(rows, columns=cols)
+    return _with_conn(_q)
+
+
+def run_query_capped(sql: str, cap: int = 1000) -> pd.DataFrame:
+    def _q(conn):
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            cols = [c[0] for c in cur.description] if cur.description else []
+            rows = cur.fetchmany(cap)
+        finally:
+            cur.close()
+        return pd.DataFrame(rows, columns=cols)
+    return _with_conn(_q)
 
 
 def _hms(secs) -> str:
@@ -119,23 +160,27 @@ def _cell(v) -> str:
 
 # --- Roster storage (Snowflake AGENT_ROSTER, keyed by PERIOD_START) --------
 def ensure_roster_table():
-    cur = get_conn().cursor()
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS AGENT_ROSTER ("
-        "PERIOD_START VARCHAR, AGENT_ID VARCHAR, AGENT_NAME VARCHAR, LEVEL VARCHAR, "
-        "DOW NUMBER, SHIFT_CODE VARCHAR, CUSTOM_START VARCHAR, CUSTOM_END VARCHAR, "
-        "UPDATED_AT VARCHAR)")
-    # Migrate an older MONTH-keyed table, if present.
-    try:
-        cur.execute("ALTER TABLE AGENT_ROSTER ADD COLUMN IF NOT EXISTS PERIOD_START VARCHAR")
-    except Exception:
-        pass
-    try:
-        cur.execute("UPDATE AGENT_ROSTER SET PERIOD_START = MONTH || '-01' "
-                    "WHERE PERIOD_START IS NULL AND MONTH IS NOT NULL")
-    except Exception:
-        pass
-    cur.close()
+    def _e(conn):
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS AGENT_ROSTER ("
+                "PERIOD_START VARCHAR, AGENT_ID VARCHAR, AGENT_NAME VARCHAR, LEVEL VARCHAR, "
+                "DOW NUMBER, SHIFT_CODE VARCHAR, CUSTOM_START VARCHAR, CUSTOM_END VARCHAR, "
+                "UPDATED_AT VARCHAR)")
+            # Migrate an older MONTH-keyed table, if present.
+            try:
+                cur.execute("ALTER TABLE AGENT_ROSTER ADD COLUMN IF NOT EXISTS PERIOD_START VARCHAR")
+            except Exception:
+                pass
+            try:
+                cur.execute("UPDATE AGENT_ROSTER SET PERIOD_START = MONTH || '-01' "
+                            "WHERE PERIOD_START IS NULL AND MONTH IS NOT NULL")
+            except Exception:
+                pass
+        finally:
+            cur.close()
+    _with_conn(_e)
 
 
 def list_periods():
@@ -168,18 +213,19 @@ def load_roster_period(period: str):
 
 
 def save_roster_period(period: str, records):
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute("DELETE FROM AGENT_ROSTER WHERE PERIOD_START = ?", (period,))
-        if records:
-            cur.executemany(
-                "INSERT INTO AGENT_ROSTER (PERIOD_START, AGENT_ID, AGENT_NAME, LEVEL, DOW, "
-                "SHIFT_CODE, CUSTOM_START, CUSTOM_END, UPDATED_AT) VALUES (?,?,?,?,?,?,?,?,?)",
-                records)
-        conn.commit()
-    finally:
-        cur.close()
+    def _s(conn):
+        cur = conn.cursor()
+        try:
+            cur.execute("DELETE FROM AGENT_ROSTER WHERE PERIOD_START = ?", (period,))
+            if records:
+                cur.executemany(
+                    "INSERT INTO AGENT_ROSTER (PERIOD_START, AGENT_ID, AGENT_NAME, LEVEL, DOW, "
+                    "SHIFT_CODE, CUSTOM_START, CUSTOM_END, UPDATED_AT) VALUES (?,?,?,?,?,?,?,?,?)",
+                    records)
+            conn.commit()
+        finally:
+            cur.close()
+    _with_conn(_s)
 
 
 def _roster_records(period, rd):
@@ -558,14 +604,7 @@ with tab_sql:
             st.error(msg)
         else:
             try:
-                cur = get_conn().cursor()
-                try:
-                    cur.execute(q)
-                    cols = [c[0] for c in cur.description] if cur.description else []
-                    rows = cur.fetchmany(1000)
-                finally:
-                    cur.close()
-                res = pd.DataFrame(rows, columns=cols)
+                res = run_query_capped(q, 1000)
                 st.caption(f"{len(res)} row(s) (capped at 1000).")
                 st.dataframe(res, use_container_width=True, hide_index=True)
                 if not res.empty:
