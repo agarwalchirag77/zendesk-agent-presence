@@ -380,21 +380,18 @@ with tab_comp:
     period = active_period_for(day)
     roster = load_roster_period(period) if period else {}
 
-    filt = [c for c in SHIFT_CHOICES if c != "off"]
-    ctl = st.columns([3, 2, 2, 3])
-    sel_shifts = ctl[0].multiselect(
-        "Shifts to include", filt, default=filt, format_func=lambda s: SHIFT_LABELS.get(s, s))
-    override = ctl[1].selectbox(
+    ctl = st.columns([2, 2, 2, 2])
+    override = ctl[0].selectbox(
         "Evaluate against", ["Roster shift", "M", "A", "N", "D", "E"],
         format_func=lambda s: s if s == "Roster shift" else SHIFT_LABELS[s])
-    late_buf = ctl[2].number_input("Late-login buffer (min)", min_value=0, value=15, step=1)
-    early_buf = ctl[3].number_input("Early-logout buffer (min)", min_value=0, value=30, step=1)
-    break_min = st.number_input("Flag mid-shift offline over (min)", min_value=0, value=5, step=1)
+    late_buf = ctl[1].number_input("Late-login buffer (min)", min_value=0, value=15, step=1)
+    early_buf = ctl[2].number_input("Early-logout buffer (min)", min_value=0, value=30, step=1)
+    break_min = ctl[3].number_input("Flag mid-shift offline over (min)", min_value=0, value=5, step=1)
     override_code = None if override == "Roster shift" else override
 
     dow = int(day.strftime("%w"))
     scheduled = [(aid, d, d["week"][dow]) for aid, d in roster.items()
-                 if d["week"].get(dow, "off") != "off" and d["week"][dow] in sel_shifts]
+                 if d["week"].get(dow, "off") != "off"]
     if not period or not roster:
         st.info(f"No roster covers **{day}**. Add a roster period in the **Roster** tab.")
     elif not scheduled:
