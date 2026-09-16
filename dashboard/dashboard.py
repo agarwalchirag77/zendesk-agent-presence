@@ -165,35 +165,45 @@ def ensure_roster_table():
         try:
             cur.execute(
                 "CREATE TABLE IF NOT EXISTS AGENT_ROSTER ("
-                "PERIOD_START VARCHAR, AGENT_ID VARCHAR, AGENT_NAME VARCHAR, LEVEL VARCHAR, "
-                "DOW NUMBER, SHIFT_CODE VARCHAR, CUSTOM_START VARCHAR, CUSTOM_END VARCHAR, "
-                "UPDATED_AT VARCHAR)")
-            # Migrate an older MONTH-keyed table, if present.
-            try:
-                cur.execute("ALTER TABLE AGENT_ROSTER ADD COLUMN IF NOT EXISTS PERIOD_START VARCHAR")
-            except Exception:
-                pass
-            try:
-                cur.execute("UPDATE AGENT_ROSTER SET PERIOD_START = MONTH || '-01' "
-                            "WHERE PERIOD_START IS NULL AND MONTH IS NOT NULL")
-            except Exception:
-                pass
+                "PERIOD_START VARCHAR, PERIOD_END VARCHAR, AGENT_ID VARCHAR, AGENT_NAME VARCHAR, "
+                "LEVEL VARCHAR, DOW NUMBER, SHIFT_CODE VARCHAR, CUSTOM_START VARCHAR, "
+                "CUSTOM_END VARCHAR, UPDATED_AT VARCHAR)")
+            # Migrate older tables (MONTH-keyed, or start-only without an end).
+            for stmt in (
+                "ALTER TABLE AGENT_ROSTER ADD COLUMN IF NOT EXISTS PERIOD_START VARCHAR",
+                "ALTER TABLE AGENT_ROSTER ADD COLUMN IF NOT EXISTS PERIOD_END VARCHAR",
+                "UPDATE AGENT_ROSTER SET PERIOD_START = MONTH || '-01' "
+                "WHERE PERIOD_START IS NULL AND MONTH IS NOT NULL",
+            ):
+                try:
+                    cur.execute(stmt)
+                except Exception:
+                    pass
         finally:
             cur.close()
     _with_conn(_e)
 
 
 def list_periods():
-    df = query("SELECT DISTINCT PERIOD_START FROM AGENT_ROSTER "
-               "WHERE PERIOD_START IS NOT NULL ORDER BY PERIOD_START DESC")
-    return [str(x) for x in df["PERIOD_START"].tolist()] if not df.empty else []
+    """Distinct roster periods as (start, end) tuples, newest start first."""
+    df = query("SELECT DISTINCT PERIOD_START, MAX(PERIOD_END) AS PERIOD_END FROM AGENT_ROSTER "
+               "WHERE PERIOD_START IS NOT NULL GROUP BY PERIOD_START ORDER BY PERIOD_START DESC")
+    return [(str(r["PERIOD_START"]), _cell(r["PERIOD_END"]) or None) for _, r in df.iterrows()]
 
 
 def active_period_for(d):
-    """The roster period covering IST date d = latest PERIOD_START <= d."""
+    """The roster period whose [PERIOD_START, PERIOD_END] range covers IST date d.
+    A NULL end is treated as open-ended. Ties break to the latest start."""
+    ds = d.isoformat()
     df = query("SELECT MAX(PERIOD_START) AS M FROM AGENT_ROSTER "
-               f"WHERE PERIOD_START <= '{d.isoformat()}'")
+               f"WHERE PERIOD_START <= '{ds}' AND (PERIOD_END IS NULL OR PERIOD_END >= '{ds}')")
     v = df["M"][0] if not df.empty else None
+    return None if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
+
+
+def period_end_for(start):
+    df = query(f"SELECT MAX(PERIOD_END) AS E FROM AGENT_ROSTER WHERE PERIOD_START = '{start}'")
+    v = df["E"][0] if not df.empty else None
     return None if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
 
 
@@ -219,8 +229,9 @@ def save_roster_period(period: str, records):
             cur.execute("DELETE FROM AGENT_ROSTER WHERE PERIOD_START = ?", (period,))
             if records:
                 cur.executemany(
-                    "INSERT INTO AGENT_ROSTER (PERIOD_START, AGENT_ID, AGENT_NAME, LEVEL, DOW, "
-                    "SHIFT_CODE, CUSTOM_START, CUSTOM_END, UPDATED_AT) VALUES (?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO AGENT_ROSTER (PERIOD_START, PERIOD_END, AGENT_ID, AGENT_NAME, "
+                    "LEVEL, DOW, SHIFT_CODE, CUSTOM_START, CUSTOM_END, UPDATED_AT) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
                     records)
             conn.commit()
         finally:
@@ -228,7 +239,7 @@ def save_roster_period(period: str, records):
     _with_conn(_s)
 
 
-def _roster_records(period, rd):
+def _roster_records(start, end, rd):
     """dict roster -> per-(agent, dow) rows."""
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     recs = []
@@ -236,12 +247,12 @@ def _roster_records(period, rd):
         cs = _cell(a.get("cstart")) or None
         ce = _cell(a.get("cend")) or None
         for _, dw in DAY_COLS:
-            recs.append((period, aid, a["name"], "", dw,
+            recs.append((start, end, aid, a["name"], "", dw,
                          a["week"].get(dw, "off"), cs, ce, now))
     return recs
 
 
-def _edited_to_records(period, df):
+def _edited_to_records(start, end, df):
     """Wide editor grid -> per-(agent, dow) rows."""
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     recs = []
@@ -249,7 +260,7 @@ def _edited_to_records(period, df):
         cs = _cell(r["Custom start"]) or None
         ce = _cell(r["Custom end"]) or None
         for label, dw in DAY_COLS:
-            recs.append((period, str(r["AGENT_ID"]), r["Agent"], "", dw,
+            recs.append((start, end, str(r["AGENT_ID"]), r["Agent"], "", dw,
                          r[label], cs, ce, now))
     return recs
 
@@ -274,7 +285,7 @@ def roster_to_csv_df(rd):
     return pd.DataFrame(rows, columns=CSV_COLS)
 
 
-def csv_to_records(period, df):
+def csv_to_records(start, end, df):
     """Parse an uploaded roster CSV into records. Returns (records, skipped)."""
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     recs, skipped = [], 0
@@ -291,7 +302,7 @@ def csv_to_records(period, df):
             code = (_cell(r[cols[csvh]]) if csvh in cols else "off") or "off"
             if code not in SHIFT_CHOICES:
                 code = "off"
-            recs.append((period, aid, name, "", dw, code, cs, ce, now))
+            recs.append((start, end, aid, name, "", dw, code, cs, ce, now))
     return recs, skipped
 
 
@@ -408,12 +419,14 @@ with tab_comp:
             start, end = win_res
             win = (end - start).total_seconds()
 
-            periods, has_open, last_logout = [], False, None
+            periods, has_open, last_logout, first_login = [], False, None, None
             for lin, lout in by_agent.get(aid, []):
                 lout_eff = lout if lout is not None else now_utc
                 a, b = max(lin, start), min(lout_eff, end)
                 if b > a:
                     periods.append((a, b))
+                    if first_login is None or lin < first_login:
+                        first_login = lin           # ACTUAL login, not clamped to shift start
                     if lout is None:
                         has_open = True
                     elif last_logout is None or lout > last_logout:
@@ -421,7 +434,6 @@ with tab_comp:
             periods.sort()
 
             online = sum((b - a).total_seconds() for a, b in periods)
-            first_login = periods[0][0] if periods else None
             last_online = periods[-1][1] if periods else None
             breaks, break_secs = 0, 0.0
             for i in range(1, len(periods)):
@@ -492,23 +504,27 @@ with tab_pres:
 # =====================  Roster  ===========================================
 with tab_roster:
     st.subheader("Roster — shift periods")
-    st.caption("A roster **period** starts on the date you pick (the Monday the rotation begins) "
-               "and applies until the next period starts. Codes: off / M / A / N / D / E / CUSTOM "
-               "(CUSTOM uses Custom start/end, HH:MM 24h IST).")
+    st.caption("A roster **period** applies to every date in its **[start, end]** range (inclusive). "
+               "Codes: off / M / A / N / D / E / CUSTOM (CUSTOM uses Custom start/end, HH:MM 24h IST).")
 
-    periods = list_periods()
+    periods = list_periods()   # [(start, end), ...] newest start first
     if periods:
-        st.caption("Existing periods: " + ", ".join(periods))
-    default_start = datetime.fromisoformat(periods[0]).date() if periods else today_ist
-    start = st.date_input("Roster start date", default_start,
-                          help="The date this rotation begins; applies until the next period start.")
+        st.caption("Existing periods: " + ", ".join(f"{s} → {e or '(open)'}" for s, e in periods))
+    default_start = datetime.fromisoformat(periods[0][0]).date() if periods else today_ist
+    dcol = st.columns(2)
+    start = dcol[0].date_input("Roster start date", default_start)
     rperiod = start.isoformat()
+    stored_end = period_end_for(rperiod)
+    default_end = datetime.fromisoformat(stored_end).date() if stored_end else start + timedelta(days=30)
+    end = dcol[1].date_input("Roster end date", default_end, min_value=start,
+                             help="The roster applies to every date from start through end, inclusive.")
+    rend = end.isoformat()
     existing = load_roster_period(rperiod)
-    prev = next((p for p in periods if p < rperiod), None)
+    prev = next((s for s, _e in periods if s < rperiod), None)
 
     b = st.columns([2, 2, 2, 3])
-    if prev and b[0].button(f"Copy {prev} → {rperiod}"):
-        save_roster_period(rperiod, _roster_records(rperiod, load_roster_period(prev)))
+    if prev and b[0].button(f"Copy {prev} shifts here"):
+        save_roster_period(rperiod, _roster_records(rperiod, rend, load_roster_period(prev)))
         st.session_state.pop(f"roster_ed_{rperiod}", None)
         st.rerun()
     src = existing if existing else {}
@@ -518,7 +534,7 @@ with tab_roster:
                             label_visibility="collapsed")
     if up is not None and b[3].button("Import uploaded CSV → replace period"):
         try:
-            recs, skipped = csv_to_records(rperiod, pd.read_csv(up, dtype=str))
+            recs, skipped = csv_to_records(rperiod, rend, pd.read_csv(up, dtype=str))
             save_roster_period(rperiod, recs)
             st.session_state.pop(f"roster_ed_{rperiod}", None)
             msg = f"Imported {len(recs)//7} agents for {rperiod}."
@@ -547,12 +563,17 @@ with tab_roster:
         },
     )
 
-    if st.button("💾 Save roster", type="primary"):
+    sb = st.columns([2, 2, 4])
+    if sb[0].button("💾 Save roster", type="primary"):
         try:
-            save_roster_period(rperiod, _edited_to_records(rperiod, edited))
-            st.success(f"Saved roster for period {rperiod} ({len(edited)} agents).")
+            save_roster_period(rperiod, _edited_to_records(rperiod, rend, edited))
+            st.success(f"Saved roster {rperiod} → {rend} ({len(edited)} agents).")
         except Exception as exc:  # noqa: BLE001
             st.error(f"Save failed: {exc}")
+    if existing and sb[1].button("🗑 Delete this period"):
+        save_roster_period(rperiod, [])
+        st.session_state.pop(f"roster_ed_{rperiod}", None)
+        st.rerun()
 
     with st.expander("➕ ➖  Add / remove agents"):
         st.caption("Add/remove saves the current grid immediately (including any edits above).")
@@ -573,7 +594,7 @@ with tab_roster:
                            "Custom start": "", "Custom end": "",
                            **{label: "off" for label, _ in DAY_COLS}}
                 merged = pd.concat([edited, pd.DataFrame([new_row])], ignore_index=True)
-                save_roster_period(rperiod, _edited_to_records(rperiod, merged))
+                save_roster_period(rperiod, _edited_to_records(rperiod, rend, merged))
                 st.session_state.pop(f"roster_ed_{rperiod}", None)
                 st.rerun()
         else:
@@ -587,7 +608,7 @@ with tab_roster:
                                     format_func=lambda t: f"{t[1]} ({t[0]})", key=f"rm_{rperiod}")
             if rc[1].button("Remove", key=f"rmbtn_{rperiod}"):
                 kept = edited[edited["AGENT_ID"].astype(str) != rpick[0]]
-                save_roster_period(rperiod, _edited_to_records(rperiod, kept))
+                save_roster_period(rperiod, _edited_to_records(rperiod, rend, kept))
                 st.session_state.pop(f"roster_ed_{rperiod}", None)
                 st.rerun()
 

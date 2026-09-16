@@ -160,7 +160,8 @@ GROUP BY 1 ORDER BY 1;
 -- here for reference / to grant write access if the dashboard uses a read-only
 -- role: the dashboard role needs INSERT/UPDATE/DELETE on this table.
 CREATE TABLE IF NOT EXISTS AGENT_ROSTER (
-  PERIOD_START VARCHAR,   -- 'YYYY-MM-DD' (the Monday the rotation begins); applies until next period
+  PERIOD_START VARCHAR,   -- 'YYYY-MM-DD' start of the roster period (inclusive)
+  PERIOD_END   VARCHAR,   -- 'YYYY-MM-DD' end of the roster period (inclusive); NULL = open-ended
   AGENT_ID     VARCHAR,
   AGENT_NAME   VARCHAR,
   LEVEL        VARCHAR,   -- L1 / L2
