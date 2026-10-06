@@ -21,6 +21,8 @@ from . import db
 ACCOUNT = os.environ.get("SNOWFLAKE_ACCOUNT", "")
 USER = os.environ.get("SNOWFLAKE_USER", "")
 PASSWORD = os.environ.get("SNOWFLAKE_PASSWORD", "")
+KEY_PATH = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PATH", "")
+KEY_PASS = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "")
 WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE", "")
 DATABASE = os.environ.get("SNOWFLAKE_DATABASE", "")
 SCHEMA = os.environ.get("SNOWFLAKE_SCHEMA", "")
@@ -28,7 +30,7 @@ ROLE = os.environ.get("SNOWFLAKE_ROLE", "")
 FLUSH_INTERVAL = int(os.environ.get("SNOWFLAKE_FLUSH_INTERVAL", "15"))
 BATCH = int(os.environ.get("SNOWFLAKE_BATCH", "500"))
 
-_REQUIRED = [ACCOUNT, USER, PASSWORD, WAREHOUSE, DATABASE, SCHEMA]
+_REQUIRED = [ACCOUNT, USER, (KEY_PATH or PASSWORD), WAREHOUSE, DATABASE, SCHEMA]
 
 
 def is_enabled() -> bool:
@@ -77,12 +79,26 @@ def _fq(table: str) -> str:
     return f"{DATABASE}.{SCHEMA}.{table}"
 
 
+def _auth_kwargs():
+    """Key-pair auth if SNOWFLAKE_PRIVATE_KEY_PATH is set, else password."""
+    if not KEY_PATH:
+        return {"password": PASSWORD}
+    from cryptography.hazmat.primitives import serialization
+    with open(KEY_PATH, "rb") as f:
+        key = serialization.load_pem_private_key(
+            f.read(), password=KEY_PASS.encode() if KEY_PASS else None)
+    return {"private_key": key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption())}
+
+
 def _connect():
     import snowflake.connector  # imported lazily so the app runs without it
 
     snowflake.connector.paramstyle = "qmark"
     kwargs = dict(
-        account=ACCOUNT, user=USER, password=PASSWORD,
+        account=ACCOUNT, user=USER, **_auth_kwargs(),
         warehouse=WAREHOUSE, database=DATABASE, schema=SCHEMA,
         login_timeout=20, network_timeout=30,
     )
