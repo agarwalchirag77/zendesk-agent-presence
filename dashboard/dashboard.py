@@ -66,12 +66,27 @@ if not _gate():
 
 
 # --- Snowflake ------------------------------------------------------------
+def _sf_auth():
+    """Key-pair auth if SNOWFLAKE_PRIVATE_KEY_PATH is set, else password."""
+    path = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PATH")
+    if not path:
+        return {"password": os.environ["SNOWFLAKE_PASSWORD"]}
+    from cryptography.hazmat.primitives import serialization
+    pw = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") or None
+    with open(path, "rb") as f:
+        key = serialization.load_pem_private_key(f.read(), password=pw.encode() if pw else None)
+    return {"private_key": key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption())}
+
+
 def _connect():
     import snowflake.connector
     snowflake.connector.paramstyle = "qmark"   # so ? binds work for roster writes
     kwargs = dict(
         account=os.environ["SNOWFLAKE_ACCOUNT"], user=os.environ["SNOWFLAKE_USER"],
-        password=os.environ["SNOWFLAKE_PASSWORD"], warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+        **_sf_auth(), warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
         database=os.environ["SNOWFLAKE_DATABASE"], schema=os.environ["SNOWFLAKE_SCHEMA"],
         client_session_keep_alive=True,   # heartbeat so the token doesn't idle-expire
     )
